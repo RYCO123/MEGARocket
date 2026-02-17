@@ -1,0 +1,8 @@
+python3 -m MAVProxy.mavproxy --master=/dev/cu.usbmodem11201 --baudrate 115200 --out=udp:127.0.0.1:14550 --out=udp:127.0.0.1:14551
+
+##run above in second terminal tab
+
+ls /dev/cu.usbmodem*
+It will return something like /dev/cu.usbmodem14201. This is your new master address.
+python3 -m MAVProxy.mavproxy --master=[PASTE_YOUR_NEW_PORT_HERE]
+
