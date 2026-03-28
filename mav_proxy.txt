@@ -1,8 +1,8 @@
-python3 -m MAVProxy.mavproxy --master=/dev/cu.usbmodem11201 --baudrate 115200 --out=udp:127.0.0.1:14550 --out=udp:127.0.0.1:14551
+## Find the serial port (run this first)
+ls /dev/cu.*
 
-##run above in second terminal tab
+## Start MAVProxy — run this as ONE single line, do not break it
+python3 -m MAVProxy.mavproxy --master=/dev/cu.usbserial-0001 --baudrate 57600 --out=udp:127.0.0.1:14550 --out=udp:127.0.0.1:14551
 
-ls /dev/cu.usbmodem*
-It will return something like /dev/cu.usbmodem14201. This is your new master address.
-python3 -m MAVProxy.mavproxy --master=[PASTE_YOUR_NEW_PORT_HERE]
-
+## If the port changes, find it with ls /dev/cu.* and replace /dev/cu.usbserial-0001
+## Baud rate is 57600 (not 115200)
