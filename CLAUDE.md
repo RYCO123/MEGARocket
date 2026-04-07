@@ -10,17 +10,17 @@ This is the **ground station side** of an autonomous UAV (fixed-wing drone/rocke
 4. When found, the ground station sends a **mission plan update** to the aircraft via MAVLink
 5. Aircraft modifies its course to investigate/converge on the target
 
-**Current status (as of Mar 2026):** Video is visible in QuickTime Player (circuits built, hardware connected). Next step is getting video into Python for processing.
+**Current status (as of Apr 2026):** Video is working again on camera index 0 after a full Walksnail reboot. `startup.py` now launches MAVProxy, applies a lean `SR1_*` and `SR2_*` telemetry profile, then starts `rocket_telemtry.py` and `video_capture.py`. The main unresolved issue is the MAVLink link quality over the radio path: QGroundControl reported about 96% loss rate during testing, and parameter download over that link was extremely slow.
 
 ---
 
 ## Hardware Stack
 
 - **Aircraft:** Fixed-wing UAV running ArduPilot (VTOL capable — has QSTABILIZE mode)
-- **Flight controller:** Connected via USB serial (`/dev/cu.usbmodem*`) at 115200 baud
+- **Flight controller / ground link:** Ranger Micro USB serial at `/dev/cu.usbserial-0001`, currently run through MAVProxy at 460800 baud
 - **Ground station:** Mac (ryancody's MacBook Air)
-- **Camera:** Downward-facing, currently outputting video visible in QuickTime Player
-- **Communication:** MAVLink over serial → MAVProxy UDP bridge
+- **Camera:** Downward-facing, captured in Python via `cv2.VideoCapture(0)`
+- **Communication:** MAVLink over ELRS via Ranger Micro → MAVProxy UDP bridge
 
 ## Software Stack
 
@@ -57,8 +57,10 @@ Flight Controller ──── MAVProxy
 | File | Purpose |
 |------|---------|
 | `main.py` | Mission control — keyboard flight control, RC overrides, HUD display |
-| `rocket_telemtry.py` | Telemetry receiver — reads serial, prints altitude/GPS/orientation/battery |
+| `rocket_telemtry.py` | Passive telemetry HUD — listens on UDP 14551 and displays altitude/GPS/orientation/battery |
 | `mav_proxy.txt` | MAVProxy startup commands |
+| `start_mavproxy.sh` | Current working MAVProxy launcher |
+| `startup.py` | Main launcher — starts MAVProxy, fetches params, applies `SR1_*`/`SR2_*`, launches telemetry + video |
 | `requirements.txt` | Python deps: pymavlink, pynput, pyserial, MAVProxy |
 | `mav.parm` | ArduPilot parameter file (cruise 12 m/s, max 22 m/s, 3300mAh battery) |
 | `mav.tlog` | Flight telemetry log (binary) |
@@ -67,25 +69,31 @@ Flight Controller ──── MAVProxy
 
 ## MAVProxy Setup
 
-Find the USB port:
+Find the serial port:
 ```bash
-ls /dev/cu.usbmodem*
+ls /dev/cu.*
 ```
 
 Start MAVProxy (bridges serial to two UDP ports):
 ```bash
-python3 -m MAVProxy.mavproxy --master=/dev/cu.usbserial-0001 --baudrate 57600 --out=udp:127.0.0.1:14550 --out=udp:127.0.0.1:14551
+./start_mavproxy.sh
 ```
-Note: if port changes, find it with `ls /dev/cu.*` — look for `cu.usbserial-*`
+
+That script currently runs:
+```bash
+python3 -m MAVProxy.mavproxy --master=/dev/cu.usbserial-0001 --baudrate 460800 --out=udp:127.0.0.1:14550 --out=udp:127.0.0.1:14551
+```
 
 - Port **14550** → QGroundControl
 - Port **14551** → Python scripts (main.py)
 
 **Startup order:**
-1. Close QGroundControl
-2. Run MAVProxy command above
-3. Open QGroundControl
-4. Run Python script in separate terminal
+1. Power on the aircraft
+2. Plug the Ranger Micro into the Mac
+3. Close QGroundControl
+4. Run `./start_mavproxy.sh`
+5. Open QGroundControl
+6. Run a Python script in a separate terminal
 
 ---
 
@@ -109,12 +117,35 @@ RC channels: Roll=Ch1, Pitch=Ch2, Yaw=Ch4
 
 **Goal:** Capture video feed in Python → detect object of interest → update MAVLink mission
 
-**Status:** Video is available in QuickTime Player. Need to capture it via Python (likely via `AVFoundation`/`cv2.VideoCapture` on macOS).
+**Status:** Video capture in Python is working again on index 0. A temporary black-screen issue was traced to the Walksnail chain rather than Python/OpenCV, because QuickTime also showed black until both Walksnail ends were rebooted.
 
 **Camera device indices (confirmed):**
 - Index 0 — drone/rocket downward camera (1920x1080 @ 10fps) ← USE THIS
 - Index 1 — MacBook built-in camera
 - Index 2 — iPhone continuity camera
+
+**Video diagnosis notes (Apr 2026):**
+- `video_capture.py` is hardcoded back to `cv2.VideoCapture(0)`.
+- macOS camera permissions were verified for VS Code/Terminal during debugging.
+- QuickTime saw the capture device but also showed black, which ruled out Python/OpenCV as the root cause.
+- Rebooting the Walksnail system restored video.
+
+## Telemetry Diagnosis (Apr 2026)
+
+- `startup.py` now starts MAVProxy with `--streamrate=-1` so MAVProxy does not impose a broad default stream profile.
+- `startup.py` fetches parameters with `param_fetch_all()` instead of requesting `MAV_DATA_STREAM_ALL`.
+- After parameter fetch, `startup.py` writes a low-bandwidth profile to both `SR1_*` and `SR2_*`:
+  - `POSITION = 2`
+  - `EXT_STAT = 1`
+  - `EXTRA1 = 5`
+  - `EXTRA2 = 2`
+  - `RAW_SENS = 0`
+  - `RC_CHAN = 0`
+  - `RAW_CTRL = 0`
+- `rocket_telemtry.py` is now passive. It does not send `REQUEST_DATA_STREAM` or `MAV_CMD_SET_MESSAGE_INTERVAL`; it only listens and reports what arrives.
+- Live test result: QGroundControl `Loss rate` was about `96%` over the radio link.
+- Live test result: parameter download over the radio path was only about `1-3 params/sec` after the initial burst.
+- Next diagnostic step: connect the flight controller directly to the Mac over USB and compare QGC loss rate and parameter download speed. If USB is healthy, the bottleneck is the ELRS/radio telemetry path rather than Python or MAVProxy.
 
 **Next steps after capture working:**
 1. Frame-by-frame processing with OpenCV

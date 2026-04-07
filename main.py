@@ -1,10 +1,17 @@
+import os
+import select
 import time
 import sys
+import termios
+import _thread
+import threading
+import tty
 from pymavlink import mavutil
 from pynput import keyboard
 
+
 class RocketCommander:
-    def __init__(self, connection_string='udp:127.0.0.1:14551'):
+    def __init__(self, connection_string='udp:127.0.0.1:14552'):
         # source_system=255 identifies this script as a 'Pilot/GCS' 
         # This is required for ArduPilot to accept WASD steering (RC Overrides)
         print(f"Connecting to Rocket via MAVProxy on {connection_string}...")
@@ -16,9 +23,16 @@ class RocketCommander:
         self.roll = 0.0
         self.mode = "UNKNOWN"
         self.armed = False
+        self.mode_slots = {}
+        self.pressed_keys = set()
+        self.parachute_released = False
+        self._status_line = ""
+        self._stdin_fd = sys.stdin.fileno() if sys.stdin.isatty() else None
+        self._stdin_attrs = None
+        self._shutdown = False
         
-        # Steering values (1500 is neutral)
-        # Mapping: Ch1: Roll, Ch2: Pitch, Ch4: Yaw
+        # Standard fixed-wing RC axis mapping.
+        # Ch1 roll -> elevons, Ch2 pitch -> elevons, Ch4 yaw -> rudders.
         self.controls = {1: 1500, 2: 1500, 4: 1500}
 
     def wait_for_heartbeat(self):
@@ -38,7 +52,53 @@ class RocketCommander:
             mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
             mode_id
         )
-        print(f"\n[CMD] Mode -> {mode_name}")
+        self.mode = mode_name
+        self.log_event(f"[CMD] Mode -> {mode_name}")
+
+    def fetch_param_value(self, param_name, timeout=1.5, attempts=3):
+        for _ in range(attempts):
+            self.master.param_fetch_one(param_name)
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                msg = self.master.recv_match(type='PARAM_VALUE', blocking=True, timeout=0.5)
+                if msg is None:
+                    continue
+                if isinstance(msg.param_id, bytes):
+                    pid = msg.param_id.decode(errors='ignore').rstrip('\x00')
+                else:
+                    pid = str(msg.param_id).rstrip('\x00')
+                if pid == param_name:
+                    return float(msg.param_value)
+        return None
+
+    def load_mode_slots(self):
+        """Load FLTMODE1..6 assignments so number keys match QGC/ArduPlane mode slots."""
+        inverse_mode_map = {mode_id: name for name, mode_id in self.master.mode_mapping().items()}
+        slots = {}
+        for slot in range(1, 7):
+            param_name = f"FLTMODE{slot}"
+            value = self.fetch_param_value(param_name)
+            if value is None:
+                continue
+            mode_id = int(round(value))
+            slots[str(slot)] = inverse_mode_map.get(mode_id, f"MODE_{mode_id}")
+        self.mode_slots = slots
+        if self.mode_slots:
+            label = " | ".join(f"{k}:{v}" for k, v in sorted(self.mode_slots.items()))
+            print(f"Loaded mode slots -> {label}")
+        else:
+            print("Warning: Could not read FLTMODE1..6. Number keys fall back to 1:MANUAL 2:QSTABILIZE 3:FBWA.")
+
+    def set_mode_from_slot(self, slot_key):
+        mode_name = self.mode_slots.get(slot_key)
+        if mode_name:
+            self.set_mode(mode_name)
+            return
+        fallback = {'1': 'MANUAL', '2': 'QSTABILIZE', '3': 'FBWA'}
+        if slot_key in fallback:
+            self.set_mode(fallback[slot_key])
+        else:
+            print(f"\n[CMD] Slot {slot_key} is not configured.")
 
     def arm_disarm(self, arm_state):
         """True to Arm, False to Disarm. Uses bypass 21196."""
@@ -48,7 +108,9 @@ class RocketCommander:
             mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
             0, val, 21196, 0, 0, 0, 0, 0
         )
-        print(f"\n[CMD] {'ARMING' if arm_state else 'DISARMING'}")
+        # Reflect operator intent immediately in the HUD; heartbeat will confirm.
+        self.armed = arm_state
+        self.log_event(f"[CMD] {'ARMING' if arm_state else 'DISARMING'}")
 
     def send_rc_overrides(self):
         """Sends digital stick positions. MUST BE ARMED to work."""
@@ -62,6 +124,40 @@ class RocketCommander:
             self.controls[4], # Ch 4: Yaw
             0, 0, 0, 0
         )
+
+    def release_parachute(self):
+        """One-shot parachute release through ArduPilot's parachute subsystem."""
+        if self.parachute_released:
+            self.log_event("[CMD] Parachute already released")
+            return
+
+        ok, ack_result = self.send_parachute_command(mavutil.mavlink.PARACHUTE_RELEASE)
+        status = "ACK" if ok else f"ack={ack_result}" if ack_result is not None else "sent/no-ack"
+        self.log_event(f"[CMD] Parachute RELEASE [{status}]")
+        if ok:
+            self.parachute_released = True
+
+    def send_parachute_command(self, action, attempts=2):
+        for _ in range(attempts):
+            self.master.mav.command_long_send(
+                self.master.target_system,
+                self.master.target_component,
+                mavutil.mavlink.MAV_CMD_DO_PARACHUTE,
+                0,
+                action,
+                0, 0, 0, 0, 0
+            )
+            deadline = time.time() + 0.6
+            while time.time() < deadline:
+                msg = self.master.recv_match(type='COMMAND_ACK', blocking=False)
+                if msg and msg.command == mavutil.mavlink.MAV_CMD_DO_PARACHUTE:
+                    # ACCEPTED(0) and IN_PROGRESS(1) are both useful positives here.
+                    return msg.result in (
+                        mavutil.mavlink.MAV_RESULT_ACCEPTED,
+                        mavutil.mavlink.MAV_RESULT_IN_PROGRESS,
+                    ), msg.result
+                time.sleep(0.02)
+        return False, None
 
     def update_telemetry(self):
         """Reads data. Filters for System 1 to avoid MAVProxy confusion."""
@@ -89,38 +185,83 @@ class RocketCommander:
             elif msg_type == 'VFR_HUD':
                 self.altitude = msg.alt
 
-    def on_press(self, key):
+    def key_token(self, key):
         try:
-            # Mode Control
-            if key.char == '1': self.set_mode('MANUAL')
-            if key.char == '2': self.set_mode('QSTABILIZE')
-            if key.char == '3': self.set_mode('FBWA')
-            if key.char == 'z': self.arm_disarm(True)
-            
-            # WASD Steering
-            if key.char == 'w': self.controls[2] = 1100 # Pitch
-            if key.char == 's': self.controls[2] = 1900 
-            if key.char == 'a': self.controls[1] = 1100 # Roll
-            if key.char == 'd': self.controls[1] = 1900
-            if key.char == 'q': self.controls[4] = 1100 # Yaw
-            if key.char == 'e': self.controls[4] = 1900
-
+            if key.char is not None:
+                return key.char.lower()
         except AttributeError:
-            if key == keyboard.Key.space: self.arm_disarm(False)
+            pass
+        return key
+
+    def log_event(self, text):
+        # Move event output to its own line and preserve the single-line HUD.
+        print(f"\n{text}")
+        if self._status_line:
+            print(f"\r\033[K{self._status_line}", end="", flush=True)
+
+    def handle_discrete_command(self, ch):
+        if ch in ('1', '2', '3', '4', '5', '6'):
+            self.set_mode_from_slot(ch)
+        elif ch == 'z':
+            self.arm_disarm(True)
+        elif ch == 'f':
+            self.release_parachute()
+        elif ch == ' ':
+            self.arm_disarm(False)
+
+    def on_press(self, key):
+        token = self.key_token(key)
+        if token in self.pressed_keys:
+            return
+        self.pressed_keys.add(token)
+
+        try:
+            ch = key.char.lower()
+            # WASD Steering
+            if ch == 'w':
+                self.controls[2] = 1100  # Pitch
+            if ch == 's':
+                self.controls[2] = 1900
+            if ch == 'a':
+                self.controls[1] = 1100  # Roll
+            if ch == 'd':
+                self.controls[1] = 1900
+            if ch == 'q':
+                self.controls[4] = 1100  # Yaw
+            if ch == 'e':
+                self.controls[4] = 1900
+        except AttributeError:
+            pass
 
     def on_release(self, key):
-        # Reset to Neutral (1500) when key is released
-        self.controls = {1: 1500, 2: 1500, 4: 1500}
+        token = self.key_token(key)
+        self.pressed_keys.discard(token)
+        if token in ('w', 's'):
+            self.controls[2] = 1500
+        if token in ('a', 'd'):
+            self.controls[1] = 1500
+        if token in ('q', 'e'):
+            self.controls[4] = 1500
 
     def run(self):
         self.wait_for_heartbeat()
+        self.load_mode_slots()
         
         # Keyboard Listener
         listener = keyboard.Listener(on_press=self.on_press, on_release=self.on_release)
         listener.start()
+        tty_thread = None
+        if self._stdin_fd is not None:
+            tty_thread = threading.Thread(target=self.tty_key_listener, daemon=True)
+            tty_thread.start()
+        else:
+            cmd_thread = threading.Thread(target=self.command_listener, daemon=True)
+            cmd_thread.start()
 
         print("\n--- MISSION CONTROL ACTIVE ---")
-        print("1:Manual | 2:Rocket | 3:Glider | Z:Arm | Space:Disarm | W,A,S,D:Steer")
+        print("1-6:QGC Flight Modes | Z:Arm | Space:Disarm | W/S:Pitch | A/D:Roll | Q/E:Yaw | F:Parachute Release")
+        print("Terminal commands: arm | disarm")
+        print("")
         
         try:
             while True:
@@ -131,18 +272,56 @@ class RocketCommander:
                     mavutil.mavlink.MAV_TYPE_GCS, 
                     mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0, 0)
 
-                # Send Steering if Armed
-                if self.armed:
-                    self.send_rc_overrides()
+                # Always send steering overrides while script is active.
+                self.send_rc_overrides()
 
                 # HUD Display
                 arm_status = "ARMED" if self.armed else "DISARMED"
-                print(f"[{arm_status}] Mode: {self.mode:11} | Alt: {self.altitude:5.1f}m | Pitch: {self.pitch:5.1f}°", end='\r')
+                self._status_line = f"[{arm_status}] Mode: {self.mode:11}"
+                print(f"\r\033[K{self._status_line}", end='', flush=True)
                 
                 time.sleep(0.05) # 20Hz update
         except KeyboardInterrupt:
             print("\nShutting down.")
             sys.exit(0)
+        finally:
+            self._shutdown = True
+            self.restore_tty()
+
+    def tty_key_listener(self):
+        if self._stdin_fd is None:
+            return
+
+        self._stdin_attrs = termios.tcgetattr(self._stdin_fd)
+        tty.setcbreak(self._stdin_fd)
+        while not self._shutdown:
+            ready, _, _ = select.select([self._stdin_fd], [], [], 0.1)
+            if not ready:
+                continue
+            ch = os.read(self._stdin_fd, 1).decode(errors='ignore')
+            if not ch:
+                continue
+            if ch == '\x03':
+                _thread.interrupt_main()
+                return
+            if ch in ('1', '2', '3', '4', '5', '6', 'z', 'f', ' '):
+                self.handle_discrete_command(ch)
+
+    def restore_tty(self):
+        if self._stdin_fd is not None and self._stdin_attrs is not None:
+            termios.tcsetattr(self._stdin_fd, termios.TCSADRAIN, self._stdin_attrs)
+            self._stdin_attrs = None
+
+    def command_listener(self):
+        while True:
+            try:
+                cmd = input().strip().lower()
+            except EOFError:
+                return
+            if cmd == 'arm':
+                self.arm_disarm(True)
+            elif cmd == 'disarm':
+                self.arm_disarm(False)
 
 if __name__ == "__main__":
     commander = RocketCommander()

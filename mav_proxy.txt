@@ -2,7 +2,7 @@
 ls /dev/cu.*
 
 ## Start MAVProxy — run this as ONE single line, do not break it
-python3 -m MAVProxy.mavproxy --master=/dev/cu.usbserial-0001 --baudrate 57600 --out=udp:127.0.0.1:14550 --out=udp:127.0.0.1:14551
+python3 -m MAVProxy.mavproxy --master=/dev/cu.usbserial-0001 --baudrate 460800 --out=udp:127.0.0.1:14550 --out=udp:127.0.0.1:14551
 
 ## If the port changes, find it with ls /dev/cu.* and replace /dev/cu.usbserial-0001
-## Baud rate is 57600 (not 115200)
+## Baud rate is 460800
