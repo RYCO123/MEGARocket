@@ -1,16 +1,18 @@
 """
 startup.py
 
-Starts MAVProxy, waits for heartbeat, fetches the vehicle parameter list,
-then launches telemetry and video scripts.
+Starts router.py (serial-to-UDP forwarder), confirms heartbeat, then launches
+the ground station GUI and WASD flight control (RocketCommander).
+
+RocketCommander is defined in main.py — not a package, just local code.
 
 Usage:
     python3 startup.py
     python3 startup.py --video-source 1
-    python3 startup.py --video-source rtsp://127.0.0.1:8554/live
 """
 
 import argparse
+import os
 import signal
 import subprocess
 import sys
@@ -21,66 +23,48 @@ from pathlib import Path
 from main import RocketCommander
 from pymavlink import mavutil
 from serial.tools import list_ports
-from tqdm import tqdm
 
 PREFERRED_SERIAL_PORT = '/dev/cu.usbserial-0001'
-BAUD_CANDIDATES = (57600, 115200, 460800)
-UDP_QGC     = 'udp:127.0.0.1:14550'
-UDP_TELEMETRY = 'udp:127.0.0.1:14551'
-UDP_CONTROL = 'udp:127.0.0.1:14552'
-BASE_DIR    = Path(__file__).resolve().parent
-TELEMETRY_SCRIPT = BASE_DIR / 'rocket_telemtry.py'
-VIDEO_SCRIPT = BASE_DIR / 'video_capture.py'
+BAUD              = 57600
+UDP_QGC           = '127.0.0.1:14550'
+UDP_TELEMETRY     = '127.0.0.1:14551'
+UDP_CONTROL       = '127.0.0.1:14552'
+UDP_MONITOR       = '127.0.0.1:14553'
+BASE_DIR          = Path(__file__).resolve().parent
+ROUTER_SCRIPT     = BASE_DIR / 'router.py'
+GROUND_STATION_SCRIPT = BASE_DIR / 'ground_station.py'
 VIDEO_SOURCE_FILE = BASE_DIR / 'camera_index.txt'
-HEARTBEAT_TIMEOUT_S = 12
-PARAM_LIST_TIMEOUT_S = 10
-PARAM_PROGRESS_TIMEOUT_S = 5
+HEARTBEAT_TIMEOUT = 12
+ROUTER_LOCAL_PORTS = (14540, 14541, 14542)
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Launch MAVProxy, telemetry, mission control, and video capture."
-    )
-    parser.add_argument(
-        '--video-source',
-        help=(
-            "Camera index or stream/device source to use for video capture. "
-            "Examples: 0, 1, /dev/video0, rtsp://..."
-        ),
-    )
-    parser.add_argument(
-        '--save-video-source',
-        action='store_true',
-        help="Persist the provided --video-source into camera_index.txt for future runs.",
-    )
-    return parser.parse_args()
-
+# ---------------------------------------------------------------------------
+# Video source
+# ---------------------------------------------------------------------------
 
 def read_video_source():
     if not VIDEO_SOURCE_FILE.exists():
         return '0'
-    source = VIDEO_SOURCE_FILE.read_text(encoding='utf-8').strip()
-    return source or '0'
+    return VIDEO_SOURCE_FILE.read_text(encoding='utf-8').strip() or '0'
 
 
 def write_video_source(source):
     VIDEO_SOURCE_FILE.write_text(f"{source}\n", encoding='utf-8')
 
 
-def prompt_for_video_source(current_source):
-    prompt = (
-        f"Video source [{current_source}] "
-        "(type a camera number like 0 or 1, or a stream URL/path): "
-    )
+def prompt_for_video_source(current):
     try:
-        entered = input(prompt).strip()
+        entered = input(f"Video source [{current}]: ").strip()
     except EOFError:
-        return current_source, False
-
+        return current, False
     if not entered:
-        return current_source, False
-    return entered, entered != current_source
+        return current, False
+    return entered, entered != current
 
+
+# ---------------------------------------------------------------------------
+# Serial port detection
+# ---------------------------------------------------------------------------
 
 def detect_serial_port():
     port_infos = list(list_ports.comports())
@@ -91,156 +75,135 @@ def detect_serial_port():
     if PREFERRED_SERIAL_PORT in ports:
         return PREFERRED_SERIAL_PORT
 
-    preferred_prefixes = (
-        '/dev/cu.usbserial',
-        '/dev/cu.usbmodem',
-        '/dev/cu.SLAB_USBtoUART',
-        '/dev/cu.wchusbserial',
-    )
-    for prefix in preferred_prefixes:
+    for prefix in ('/dev/cu.usbserial', '/dev/cu.usbmodem',
+                   '/dev/cu.SLAB_USBtoUART', '/dev/cu.wchusbserial'):
         for port in ports:
             if port.startswith(prefix):
                 return port
 
-    # Fallback: only choose likely USB/UART adapters.
-    usb_like = []
+    usb_tokens = ('usb', 'uart', 'cp210', 'ftdi', 'ch340', 'silicon labs')
     for p in port_infos:
-        identity = " ".join(
-            str(x or "")
-            for x in (p.device, p.description, p.hwid, p.manufacturer, p.product)
-        ).lower()
-        if any(
-            token in identity
-            for token in (
-                "usb",
-                "uart",
-                "cp210",
-                "ftdi",
-                "ch340",
-                "silicon labs",
-                "vid:pid",
-            )
-        ):
-            usb_like.append(p.device)
-    if usb_like:
-        return sorted(usb_like)[0]
+        identity = ' '.join(str(x or '') for x in
+                            (p.device, p.description, p.hwid,
+                             p.manufacturer, p.product)).lower()
+        if any(t in identity for t in usb_tokens):
+            return p.device
     return None
 
 
-def start_mavproxy(serial_port, baud):
-    cmd = [
-        sys.executable, '-m', 'MAVProxy.mavproxy',
-        f'--master={serial_port}',
-        f'--baudrate={baud}',
-        '--streamrate=-1',
-        f'--out={UDP_QGC}',
-        f'--out={UDP_TELEMETRY}',
-        f'--out={UDP_CONTROL}',
-    ]
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-    )
-    return proc
+# ---------------------------------------------------------------------------
+# Router (serial-to-UDP forwarder)
+# ---------------------------------------------------------------------------
+
+def start_router(serial_port):
+    cmd = [sys.executable, str(ROUTER_SCRIPT), serial_port, str(BAUD)]
+    return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, bufsize=1, start_new_session=True)
 
 
-def start_script(script_path, *args):
-    return subprocess.Popen([sys.executable, str(script_path), *args], cwd=BASE_DIR)
-
-
-def wait_for_params():
-    print("Connecting via MAVProxy...")
-
-    # Give MAVProxy a moment to bind the UDP port
-    time.sleep(2)
-
-    conn = mavutil.mavlink_connection(UDP_TELEMETRY)
-
+def wait_for_heartbeat():
+    time.sleep(0.3)   # let router bind UDP ports
+    conn = mavutil.mavlink_connection(f'udp:{UDP_TELEMETRY}')
     print("Waiting for heartbeat...", end=' ', flush=True)
-    hb = conn.wait_heartbeat(timeout=HEARTBEAT_TIMEOUT_S)
+    hb = conn.wait_heartbeat(timeout=HEARTBEAT_TIMEOUT)
+    conn.close()
     if hb is None:
-        conn.close()
-        raise TimeoutError("No heartbeat seen on UDP 14551.")
+        raise TimeoutError(f"No heartbeat on UDP {UDP_TELEMETRY}.")
     print("OK")
 
-    # Request only parameters instead of enabling all telemetry streams.
-    conn.param_fetch_all()
 
-    # Wait for first PARAM_VALUE to know total count
-    print("Waiting for parameter list...")
-    while True:
-        msg = conn.recv_match(type='PARAM_VALUE', blocking=True, timeout=PARAM_LIST_TIMEOUT_S)
-        if msg:
-            total = msg.param_count
-            break
+def connect(serial_port):
+    print(f"Starting router on {serial_port} @ {BAUD} baud...")
+    proc = start_router(serial_port)
 
-    seen = set()
-    bar = tqdm(total=total, desc="Parameters", unit="param", ncols=70)
-
-    while len(seen) < total:
-        msg = conn.recv_match(type='PARAM_VALUE', blocking=True, timeout=PARAM_PROGRESS_TIMEOUT_S)
-        if msg is None:
-            break
-        if msg.param_index not in seen:
-            seen.add(msg.param_index)
-            bar.update(1)
-
-    bar.close()
-    conn.close()
-
-
-def stop_mavproxy(proc):
-    if proc.poll() is not None:
-        return
-    proc.terminate()
     try:
-        proc.wait(timeout=3)
-    except subprocess.TimeoutExpired:
-        proc.kill()
+        time.sleep(0.3)
+        code = proc.poll()
+        if code is not None:
+            err = proc.stdout.read()
+            raise RuntimeError(
+                f"router.py exited (code {code}). "
+                f"{err or 'Port may be in use.'}"
+            )
+
+        wait_for_heartbeat()
+        return proc
+    except Exception:
+        stop_process(proc, "router")
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Subprocess helpers
+# ---------------------------------------------------------------------------
+
+def start_script(path, *args):
+    return subprocess.Popen([sys.executable, str(path), *args],
+                            cwd=BASE_DIR, start_new_session=True)
+
+
+def _signal_process_group(proc, sig):
+    try:
+        os.killpg(proc.pid, sig)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return False
+
+
+def cleanup_stale_router_processes():
+    lsof_cmd = ['lsof', '-t', '-nP']
+    for port in ROUTER_LOCAL_PORTS:
+        lsof_cmd.append(f'-iUDP:{port}')
+
+    result = subprocess.run(lsof_cmd, capture_output=True, text=True, check=False)
+    if result.returncode not in (0, 1):
+        return
+
+    pids = sorted({int(line.strip()) for line in result.stdout.splitlines() if line.strip()})
+    if not pids:
+        return
+
+    print(f"Cleaning up stale router listener(s): {', '.join(str(pid) for pid in pids)}")
+    for pid in pids:
         try:
-            proc.wait(timeout=3)
-        except subprocess.TimeoutExpired:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            continue
+
+    deadline = time.time() + 2.0
+    while time.time() < deadline:
+        remaining = []
+        for pid in pids:
+            try:
+                os.kill(pid, 0)
+                remaining.append(pid)
+            except ProcessLookupError:
+                continue
+        if not remaining:
             return
+        time.sleep(0.1)
 
-
-def try_connect_with_bauds(serial_port):
-    last_error = None
-    print(f"Connecting on serial port: {serial_port}")
-    for baud in BAUD_CANDIDATES:
-        print(f"Trying baud {baud}...")
-        proc = start_mavproxy(serial_port, baud)
+    for pid in remaining:
         try:
-            # If MAVProxy exits immediately, usually serial port is busy/unavailable.
-            time.sleep(1.2)
-            code = proc.poll()
-            if code is not None:
-                err = proc.stderr.read().decode("utf-8", errors="ignore").strip()
-                raise RuntimeError(
-                    f"MAVProxy exited early (code {code}). "
-                    f"{err or 'Serial port may be in use (close QGC serial auto-connect).'}"
-                )
-            wait_for_params()
-            print(f"Connected at baud {baud}.")
-            return proc, baud
-        except Exception as exc:
-            last_error = exc
-            stop_mavproxy(proc)
-            print(f"  Failed at {baud}: {exc}")
-    raise RuntimeError(f"Unable to acquire heartbeat on {serial_port}. Last error: {last_error}")
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            continue
 
 
 def stop_process(proc, name):
     if proc.poll() is not None:
         return
-
     print(f"Stopping {name}...")
-    proc.terminate()
+    signaled = _signal_process_group(proc, signal.SIGTERM)
+    if not signaled:
+        proc.terminate()
     try:
         proc.wait(timeout=5)
     except subprocess.TimeoutExpired:
-        print(f"{name} did not exit after SIGTERM, killing it.")
-        proc.kill()
+        if not _signal_process_group(proc, signal.SIGKILL):
+            proc.kill()
         proc.wait(timeout=5)
 
 
@@ -252,9 +215,8 @@ def shutdown(processes):
 def monitor(processes):
     while True:
         for name, proc in processes:
-            code = proc.poll()
-            if code is not None:
-                raise RuntimeError(f"{name} exited unexpectedly with code {code}.")
+            if proc.poll() is not None:
+                raise RuntimeError(f"{name} exited unexpectedly.")
         time.sleep(1)
 
 
@@ -263,63 +225,74 @@ def monitor_in_background(processes):
         try:
             monitor(processes)
         except Exception as exc:
-            print(f"\nBackground process failure: {exc}")
+            print(f"\nProcess failure: {exc}")
             signal.raise_signal(signal.SIGINT)
-
-    thread = threading.Thread(target=_worker, daemon=True)
-    thread.start()
-    return thread
+    threading.Thread(target=_worker, daemon=True).start()
 
 
-if __name__ == "__main__":
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        description="Launch router, ground station, and WASD flight control.")
+    p.add_argument('--video-source',
+                   help="Camera index or stream URL (e.g. 0, 1, rtsp://...)")
+    p.add_argument('--save-video-source', action='store_true',
+                   help="Persist --video-source to camera_index.txt")
+    return p.parse_args()
+
+
+if __name__ == '__main__':
     args = parse_args()
     processes = []
     try:
-        saved_video_source = read_video_source()
-        video_source = args.video_source or saved_video_source
-        source_changed = False
-
+        # Video source
+        saved = read_video_source()
+        video_source = args.video_source or saved
         if args.video_source:
-            source_changed = args.video_source != saved_video_source
+            source_changed = args.video_source != saved
         elif sys.stdin.isatty():
-            video_source, source_changed = prompt_for_video_source(saved_video_source)
-
+            video_source, source_changed = prompt_for_video_source(saved)
+        else:
+            source_changed = False
         if args.save_video_source or source_changed:
             write_video_source(video_source)
-            print(f"Saved video source to {VIDEO_SOURCE_FILE.name}: {video_source}")
+            print(f"Video source saved: {video_source}")
 
-        active_serial_port = detect_serial_port()
-        if not active_serial_port:
+        # Serial port
+        port = detect_serial_port()
+        if not port:
             raise RuntimeError(
-                "No USB telemetry serial device found. "
-                "Plug in the adapter and run `ls /dev/cu.*` to verify a /dev/cu.usb* device exists."
+                "No serial device found. "
+                "Plug in the radio adapter and verify with `ls /dev/cu.*`"
             )
 
-        print(f"Using serial port: {active_serial_port}")
-        mavproxy_proc, active_baud = try_connect_with_bauds(active_serial_port)
-        processes.append(("MAVProxy", mavproxy_proc))
+        # Router + heartbeat
+        cleanup_stale_router_processes()
+        router_proc = connect(port)
+        processes.append(("router", router_proc))
 
-        print("\nSystem ready. MAVProxy is running on:")
-        print(f"  Serial → {active_serial_port} @ {active_baud}")
-        print(f"  QGroundControl → {UDP_QGC}")
-        print(f"  Telemetry HUD → {UDP_TELEMETRY}")
-        print(f"  Mission control → {UDP_CONTROL}")
-        print(f"  Video source → {video_source}")
+        print(f"\nReady — {port} @ {BAUD}")
+        print(f"  QGroundControl → udp:{UDP_QGC}")
+        print(f"  Ground station → udp:{UDP_TELEMETRY}")
+        print(f"  Flight control → udp:{UDP_CONTROL}")
+        print(f"  Diagnostics    → udp:{UDP_MONITOR}")
+        print(f"  Video source   → {video_source}\n")
 
-        print("\nStarting telemetry console...")
-        telemetry_proc = start_script(TELEMETRY_SCRIPT)
-        processes.append(("telemetry", telemetry_proc))
+        # Ground station GUI (vision + auto-launches QGC)
+        processes.append(("ground_station",
+                          start_script(GROUND_STATION_SCRIPT, '--source', video_source)))
 
-        print("Starting video capture...")
-        video_proc = start_script(VIDEO_SCRIPT, '--source', video_source)
-        processes.append(("video capture", video_proc))
-
-        print("Starting mission control (WASD) in this terminal...")
         monitor_in_background(processes)
 
-        print("\nPress Ctrl+C to stop all processes.\n")
-        commander = RocketCommander(connection_string=UDP_CONTROL)
+        print("Press Ctrl+C to stop.\n")
+
+        # WASD flight control runs in the main thread (needs keyboard focus)
+        commander = RocketCommander(connection_string=f'udp:{UDP_CONTROL}')
         commander.run()
+
     except KeyboardInterrupt:
         print("\nShutdown requested.")
     except Exception as exc:

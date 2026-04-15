@@ -1,0 +1,139 @@
+# config/params.yaml
+#
+# Non-default ArduPilot parameters for the rocket-glider.
+# ONLY parameters that need to differ from ArduPilot defaults are here.
+# Push to FC with: python3 mavlink_interface/param_manager.py
+#
+# Calibration parameters (INS_*, COMPASS_OFS_*, AHRS_TRIM_*, AHRS_ORIENTATION)
+# are NEVER written by this script. They are protected.
+# See calibration/protected_params.py for the full protected list.
+#
+# Note on servo limits: ±15° deflection assumes standard servo geometry.
+# Verify physically before flight — adjust SERVO*_MIN/MAX if deflection is
+# more or less than 15° at these PWM values.
+
+# ---------------------------------------------------------------------------
+# COMPASS
+# ---------------------------------------------------------------------------
+# Disabled — severe electromagnetic interference from airframe electronics.
+# ArduPilot uses GPS velocity for heading (reliable at cruise speed 12 m/s).
+COMPASS_ENABLE: 0
+
+# ---------------------------------------------------------------------------
+# SERVO OUTPUT FUNCTIONS
+# ---------------------------------------------------------------------------
+# ArduPilot function codes:
+#   21 = Rudder
+#   77 = Elevon left  (mixes aileron + elevator automatically)
+#   78 = Elevon right (mixes aileron + elevator automatically)
+#    0 = Passthrough  (Python controls directly via DO_SET_SERVO)
+#
+# Physical mapping:
+#   SERVO1 = Rudder A
+#   SERVO2 = Right elevon
+#   SERVO3 = Rudder B  (same signal as SERVO1 — check if needs reversing)
+#   SERVO4 = Left elevon
+#   SERVO5-7 = unused / disabled
+#   SERVO8   = Wing deployment (Python-controlled, 1000=stowed, 2000=deployed)
+SERVO1_FUNCTION: 21
+SERVO2_FUNCTION: 78
+SERVO3_FUNCTION: 21
+SERVO4_FUNCTION: 77
+SERVO5_FUNCTION: 0
+SERVO6_FUNCTION: 0
+SERVO7_FUNCTION: 0
+SERVO8_FUNCTION: 0
+
+# Neutral (trim) positions in microseconds
+SERVO1_TRIM: 1500
+SERVO2_TRIM: 1500
+SERVO3_TRIM: 1500
+SERVO4_TRIM: 1500
+SERVO5_TRIM: 1000
+SERVO6_TRIM: 1000
+SERVO7_TRIM: 1000
+SERVO8_TRIM: 1000
+
+# Physical travel limits — ±15° ≈ ±167 µs from 1500 center
+# If SERVO3 rudder moves opposite direction to SERVO1, set SERVO3_REVERSED: 1
+SERVO1_MIN: 1200
+SERVO1_MAX: 1800
+SERVO2_MIN: 1200
+SERVO2_MAX: 1800
+SERVO3_MIN: 1200
+SERVO3_MAX: 1800
+SERVO4_MIN: 1200
+SERVO4_MAX: 1800
+SERVO5_MIN: 1000
+SERVO5_MAX: 2000
+SERVO6_MIN: 1000
+SERVO6_MAX: 2000
+SERVO7_MIN: 1000
+SERVO7_MAX: 2000
+SERVO8_MIN: 1000
+SERVO8_MAX: 2000
+
+# Reverse flags — set to 1 if a surface deflects opposite to expected
+# Verify: in FBWA roll right → right elevon up, left elevon down
+#         in FBWA pitch up  → both elevons up
+#         in FBWA yaw right → rudder deflects right
+SERVO1_REVERSED: 0
+SERVO2_REVERSED: 0
+SERVO3_REVERSED: 0
+SERVO4_REVERSED: 0
+SERVO5_REVERSED: 0
+SERVO6_REVERSED: 0
+SERVO7_REVERSED: 0
+SERVO8_REVERSED: 0
+
+# ---------------------------------------------------------------------------
+# FLIGHT MODES
+# ---------------------------------------------------------------------------
+# Mode numbers: 0=MANUAL  2=FBWA  15=GUIDED
+# Assign to RC switch positions. MANUAL is fallback on all unused positions.
+FLTMODE1: 0     # MANUAL  — full manual, no stabilization
+FLTMODE2: 2     # FBWA    — stabilized glide
+FLTMODE3: 15    # GUIDED  — Python sends GPS targets
+FLTMODE4: 0     # MANUAL  (spare)
+FLTMODE5: 2     # FBWA    (spare)
+FLTMODE6: 0     # MANUAL  — failsafe fallback
+
+# ---------------------------------------------------------------------------
+# AIRSPEED
+# ---------------------------------------------------------------------------
+AIRSPEED_CRUISE: 12.0   # m/s — nominal cruise / best glide speed
+AIRSPEED_MIN: 9.0       # m/s — minimum safe speed (stall margin)
+AIRSPEED_MAX: 22.0      # m/s — structural limit
+
+# ---------------------------------------------------------------------------
+# UNPOWERED GLIDER
+# ---------------------------------------------------------------------------
+THR_MAX: 0              # No throttle — unpowered glider
+
+# TECS (Total Energy Control System) — governs speed/altitude trade-off
+# SPDWEIGHT=2 prioritizes maintaining airspeed over altitude (correct for
+# unpowered flight — let it descend rather than stall trying to hold alt)
+TECS_SPDWEIGHT: 2.0
+TECS_SINK_MIN: 1.5      # m/s — best glide sink rate. Tune from flight data.
+TECS_SINK_MAX: 5.0      # m/s — max acceptable sink rate
+
+# Prevent stall in stabilized modes
+STALL_PREVENTION: 1
+
+# ---------------------------------------------------------------------------
+# TELEMETRY STREAM RATES (low bandwidth over radio)
+# ---------------------------------------------------------------------------
+SR1_POSITION: 2
+SR1_EXT_STAT: 1
+SR1_EXTRA1: 5
+SR1_EXTRA2: 2
+SR1_RAW_SENS: 0
+SR1_RC_CHAN: 0
+SR1_RAW_CTRL: 0
+SR2_POSITION: 2
+SR2_EXT_STAT: 1
+SR2_EXTRA1: 5
+SR2_EXTRA2: 2
+SR2_RAW_SENS: 0
+SR2_RC_CHAN: 0
+SR2_RAW_CTRL: 0

@@ -1,7 +1,9 @@
-pymavlink==2.4.41
-pynput==1.7.6
-pyserial==3.5
-MAVProxy==1.8.68
-gnureadline
-opencv-python>=4.0
+pymavlink
+pynput
+pyserial
+opencv-python
+numpy
+matplotlib
 tqdm
+pyyaml
+Pillow
