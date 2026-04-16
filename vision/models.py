@@ -3,12 +3,6 @@ from typing import Optional
 
 
 @dataclass(frozen=True)
-class CameraModel:
-    horizontal_fov_deg: float
-    vertical_fov_deg: float
-
-
-@dataclass(frozen=True)
 class TelemetrySample:
     altitude_m: float
     pitch_deg: float = 0.0
@@ -41,5 +35,3 @@ class TrackingResult:
     detection: Optional[Detection]
     coordinate: Optional[CameraRelativeCoordinate]
     telemetry: TelemetrySample
-    camera_model: CameraModel
-    suggested_camera_model: Optional[CameraModel] = None

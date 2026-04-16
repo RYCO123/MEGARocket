@@ -3,8 +3,37 @@ from .models import TelemetrySample
 
 
 class TelemetryProvider:
-    def get_latest(self):
+    def get_latest(self) -> TelemetrySample:
         raise NotImplementedError
+
+
+class LiveTelemetryProvider(TelemetryProvider):
+    """
+    Reads live altitude / pitch / roll from a callable at runtime.
+
+    Pass the TelemetryReceiver.get method:
+        LiveTelemetryProvider(telem_receiver.get)
+
+    The callable must return a dict with keys: alt, pitch, roll, yaw.
+    If altitude is 0 or missing (link not yet up) the fallback altitude
+    is used so the projector keeps returning valid coordinates.
+    """
+
+    def __init__(self, get_fn, fallback_alt_m: float = 0.0):
+        self._get_fn = get_fn
+        self._fallback_alt_m = fallback_alt_m
+
+    def get_latest(self) -> TelemetrySample:
+        d = self._get_fn()
+        alt = float(d.get('alt', 0.0))
+        if alt <= 0.0:
+            alt = self._fallback_alt_m
+        return TelemetrySample(
+            altitude_m=alt,
+            pitch_deg=float(d.get('pitch', 0.0)),
+            roll_deg=float(d.get('roll', 0.0)),
+            yaw_deg=float(d.get('yaw', 0.0)),
+        )
 
 
 class StaticTelemetryProvider(TelemetryProvider):

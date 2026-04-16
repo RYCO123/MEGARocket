@@ -31,6 +31,7 @@ UDP_TELEMETRY     = '127.0.0.1:14551'
 UDP_CONTROL       = '127.0.0.1:14552'
 UDP_MONITOR       = '127.0.0.1:14553'
 BASE_DIR          = Path(__file__).resolve().parent
+CALIBRATION_CSV   = BASE_DIR / 'vision' / 'results' / 'calibration.csv'
 ROUTER_SCRIPT     = BASE_DIR / 'router.py'
 GROUND_STATION_SCRIPT = BASE_DIR / 'ground_station.py'
 VIDEO_SOURCE_FILE = BASE_DIR / 'camera_index.txt'
@@ -273,6 +274,10 @@ if __name__ == '__main__':
         cleanup_stale_router_processes()
         router_proc = connect(port)
         processes.append(("router", router_proc))
+
+        if not CALIBRATION_CSV.exists():
+            print(f"[vision] WARNING: lens calibration not found — projection disabled.")
+            print(f"         Run:  python3 vision/calibrate_lens.py --height-cm <HEIGHT>\n")
 
         print(f"\nReady — {port} @ {BAUD}")
         print(f"  QGroundControl → udp:{UDP_QGC}")

@@ -7,22 +7,25 @@ import threading
 import time
 from pathlib import Path
 
+import sys
+from pathlib import Path as _Path
+sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
+
 from vision import (
-    CameraModel,
-    DEFAULT_CAMERA_MODEL,
-    GroundProjector,
+    CALIBRATION_CSV,
+    CalibratedProjector,
+    NullProjector,
     StaticTelemetryProvider,
     TELEMETRY_SCENARIOS,
     VisionTracker,
 )
-from vision.config import DEFAULT_TARGET_COLOR, TARGET_COLOR_RANGES
-from vision.config import DEFAULT_CAMERA_MODEL_NAME, DEFAULT_TARGET_MIN_AREA_PX
+from vision.config import DEFAULT_TARGET_COLOR, DEFAULT_TARGET_MIN_AREA_PX, TARGET_COLOR_RANGES
 from vision.config import BENCH_TARGET_OFFSET_M
 
 WINDOW_NAME = "Vision Tracker"
 MASK_WINDOW_NAME = "Vision Mask"
 CALIBRATION_SAMPLE_COUNT = 10
-CALIBRATION_LOG_PATH = Path(__file__).resolve().parent / "vision_calibration_log.csv"
+CALIBRATION_LOG_PATH = Path(__file__).resolve().parent / "results" / "vision_calibration_log.csv"
 LAST_CLICK_INFO = {
     "pixel": None,
     "bgr": None,
@@ -179,8 +182,6 @@ class CalibrationLogger:
                     "error_m",
                     "error_pct",
                     "camera_height_m",
-                    "camera_hfov_deg",
-                    "camera_vfov_deg",
                     "target_color",
                 ]
             )
@@ -219,8 +220,6 @@ class CalibrationLogger:
                     f"{error_m:+.6f}",
                     f"{error_pct:+.3f}",
                     f"{result.telemetry.altitude_m:.6f}",
-                    f"{result.camera_model.horizontal_fov_deg:.3f}",
-                    f"{result.camera_model.vertical_fov_deg:.3f}",
                     result.detection.label,
                 ]
             )
@@ -283,16 +282,9 @@ def parse_args():
         help="Override scenario yaw in degrees.",
     )
     parser.add_argument(
-        '--hfov-deg',
-        type=float,
-        default=DEFAULT_CAMERA_MODEL.horizontal_fov_deg,
-        help="Camera horizontal field of view in degrees.",
-    )
-    parser.add_argument(
-        '--vfov-deg',
-        type=float,
-        default=DEFAULT_CAMERA_MODEL.vertical_fov_deg,
-        help="Camera vertical field of view in degrees.",
+        '--calibration-csv',
+        default=str(CALIBRATION_CSV),
+        help="Path to the lens calibration CSV (produced by calibrate_lens.py).",
     )
     parser.add_argument(
         '--calibration-input',
@@ -325,11 +317,11 @@ def build_tracker(args):
     else:
         telemetry = StaticTelemetryProvider.from_scenario(args.scenario)
 
-    camera_model = CameraModel(
-        horizontal_fov_deg=args.hfov_deg,
-        vertical_fov_deg=args.vfov_deg,
-    )
-    projector = GroundProjector(camera_model)
+    try:
+        projector = CalibratedProjector(args.calibration_csv)
+    except FileNotFoundError as exc:
+        print(f"[vision] WARNING: {exc}\nProjection disabled — run vision/calibrate_lens.py first.")
+        projector = NullProjector()
     return VisionTracker(detector, telemetry, projector)
 
 
@@ -482,7 +474,7 @@ def draw_overlay(frame, result, target_distance_m):
     coord = result.coordinate
     cv2.putText(
         frame,
-        f"relative xyz=({coord.x_m:.2f}, {coord.y_m:.2f}, {coord.z_m:.2f}) m",
+        f"relative  right={coord.x_m:.2f}m  fwd={coord.y_m:.2f}m  alt={coord.z_m:.2f}m",
         (20, 90),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.65,
@@ -509,7 +501,7 @@ def draw_overlay(frame, result, target_distance_m):
     )
     cv2.putText(
         frame,
-        "frame: x=right y=forward z=down",
+        "x=right(stbd)  y=forward(nose)  z=alt",
         (20, height - 20),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.55,
@@ -576,8 +568,7 @@ def main():
     print(
         "Tracking target with "
         f"color={args.target_color}, scenario={args.scenario}, "
-        f"camera='{DEFAULT_CAMERA_MODEL_NAME}', "
-        f"hfov={args.hfov_deg}, vfov={args.vfov_deg}"
+        f"calibration={args.calibration_csv}"
     )
     print(f"Calibration CSV: {CALIBRATION_LOG_PATH}")
     if distance_listener is not None:

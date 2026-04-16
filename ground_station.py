@@ -37,9 +37,10 @@ from pymavlink import mavutil
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from vision import (
-    DEFAULT_CAMERA_MODEL,
-    GroundProjector,
-    StaticTelemetryProvider,
+    CALIBRATION_CSV,
+    CalibratedProjector,
+    LiveTelemetryProvider,
+    NullProjector,
     TELEMETRY_SCENARIOS,
     VisionTracker,
 )
@@ -105,18 +106,29 @@ class VisionWorker:
         if not cap.isOpened():
             self._push(self.frame_q, self._err_frame(f"Cannot open {self.video_source!r}"))
             return
-        while not self._stop.is_set():
-            ret, frame = cap.read()
-            if not ret:
-                time.sleep(0.02)
-                continue
-            result = self.tracker.process_frame(frame)
-            self._annotate(frame, result)
-            self._push(self.frame_q, frame)
-            mask = self.tracker.build_debug_mask(frame)
-            if mask is not None:
-                self._push(self.mask_q, cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR))
-        cap.release()
+        try:
+            while not self._stop.is_set():
+                ret, frame = cap.read()
+                if not ret:
+                    time.sleep(0.02)
+                    continue
+                orig_w = frame.shape[1]
+                result = self.tracker.process_frame(frame)
+                mask   = self.tracker.build_debug_mask(frame)
+                # Rotate 90° CCW so +y (fwd) is up and +x (right) is right on screen
+                frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+                self._annotate(frame, result, orig_w)
+                self._push(self.frame_q, frame)
+                if mask is not None:
+                    mask = cv2.rotate(mask, cv2.ROTATE_90_COUNTERCLOCKWISE)
+                    self._push(self.mask_q, cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR))
+        except Exception as exc:
+            import traceback
+            print(f"[vision] worker crash: {exc}")
+            traceback.print_exc()
+            self._push(self.frame_q, self._err_frame(str(exc)))
+        finally:
+            cap.release()
 
     @staticmethod
     def _push(q, item):
@@ -129,19 +141,36 @@ class VisionWorker:
             except queue.Full: pass
 
     @staticmethod
-    def _annotate(frame, result):
+    def _annotate(frame, result, orig_w):
+        h, w = frame.shape[:2]
+        cx, cy = w // 2, h // 2
+
+        # Red center +  (always visible)
+        r = 12
+        cv2.line(frame, (cx - r, cy), (cx + r, cy), (0, 0, 220), 2)
+        cv2.line(frame, (cx, cy - r), (cx, cy + r), (0, 0, 220), 2)
+
         det = result.detection
         if det is None:
             cv2.putText(frame, "no target", (14, 34),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.65, (80, 80, 220), 2)
             return
-        cv2.rectangle(frame, (det.x_px, det.y_px),
-                      (det.x_px + det.width_px, det.y_px + det.height_px), (0, 255, 80), 2)
-        cv2.circle(frame, (int(det.center_x_px), int(det.center_y_px)), 6, (0, 255, 255), -1)
+
+        # Transform detection coords from original frame to rotated frame.
+        # 90° CCW: original (px, py) → rotated (py, orig_w - 1 - px)
+        rcx = int(det.center_y_px)
+        rcy = orig_w - 1 - int(det.center_x_px)
+        rx  = det.y_px
+        ry  = orig_w - 1 - det.x_px - det.width_px
+        rw  = det.height_px
+        rh  = det.width_px
+
+        cv2.rectangle(frame, (rx, ry), (rx + rw, ry + rh), (0, 255, 80), 2)
+        cv2.circle(frame, (rcx, rcy), 6, (0, 255, 255), -1)
         if result.coordinate is not None:
             c = result.coordinate
             cv2.putText(frame,
-                        f"{det.label}  xyz=({c.x_m:.2f}, {c.y_m:.2f}, {c.z_m:.2f}) m",
+                        f"{det.label}  right={c.x_m:.2f}m  fwd={c.y_m:.2f}m  alt={c.z_m:.2f}m",
                         (14, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (0, 255, 80), 2)
 
     @staticmethod
@@ -266,14 +295,15 @@ class GroundStationApp:
         self._img_main = blank
         self._img_mask = blank
 
-        self._main_lbl = self._titled_image(top, "VISION FEED",     blank, pady_bot=PADDING // 2)
-        self._mask_lbl = self._titled_image(top, "DETECTION MASK",  blank, pady_bot=0)
+        # Portrait panels sit side by side — each is narrow, together they fit the screen.
+        self._main_lbl = self._titled_image(top, "VISION FEED",    blank, padx_right=PADDING)
+        self._mask_lbl = self._titled_image(top, "DETECTION MASK", blank, padx_right=0)
 
     @staticmethod
-    def _titled_image(parent, title: str, blank_img, *, pady_bot: int) -> tk.Label:
+    def _titled_image(parent, title: str, blank_img, *, padx_right: int) -> tk.Label:
         outer = tk.Frame(parent, bg=PANEL,
                          highlightbackground=BORDER, highlightthickness=1)
-        outer.pack(pady=(0, pady_bot))
+        outer.pack(side=tk.LEFT, padx=(0, padx_right))
         tk.Label(outer, text=title, bg=PANEL, fg=DIM,
                  font=("Courier", 9, "bold"), anchor="w").pack(fill="x", padx=6, pady=(3, 0))
         lbl = tk.Label(outer, image=blank_img, bg="#000000")
@@ -368,24 +398,30 @@ def main():
     screen_w = root.winfo_screenwidth()
     screen_h = root.winfo_screenheight()
 
-    # Vision panels: leave ≥600 px for QGC on the right.
-    vis_w = min(560, screen_w - 600 - PADDING * 2)
-    vis_w = max(vis_w, 300)
-    vis_h = vis_w * 9 // 16
+    # Vision panels are portrait after 90° CCW rotation (original 16:9 → 9:16).
+    # Size by height first so the panel fits the screen, then derive width.
+    vis_h = min(screen_h - PADDING * 4, 560)
+    vis_h = max(vis_h, 300)
+    vis_w = vis_h * 9 // 16
 
     # Position at top-left; let tkinter size the window to fit the panels.
     root.geometry("+0+0")
     root.deiconify()
 
-    # Vision pipeline
-    detector  = build_detector(args.target_color, min_area_px=args.min_area)
-    telem_prov = StaticTelemetryProvider.from_scenario(args.scenario)
-    projector  = GroundProjector(DEFAULT_CAMERA_MODEL)
-    tracker    = VisionTracker(detector, telem_prov, projector)
-    vision     = VisionWorker(normalize_source(args.source), tracker)
-
-    # Telemetry receiver (logs arm/mode events to the VSCode terminal)
+    # Telemetry receiver — starts immediately so live alt/pitch/roll feed into vision
     telem = TelemetryReceiver()
+    fallback_alt_m = TELEMETRY_SCENARIOS[args.scenario].altitude_m
+    telem_prov = LiveTelemetryProvider(telem.get, fallback_alt_m=fallback_alt_m)
+
+    # Vision pipeline
+    detector = build_detector(args.target_color, min_area_px=args.min_area)
+    try:
+        projector = CalibratedProjector(CALIBRATION_CSV)
+    except FileNotFoundError as exc:
+        print(f"[vision] WARNING: {exc}\nProjection disabled — run vision/calibrate_lens.py first.")
+        projector = NullProjector()
+    tracker = VisionTracker(detector, telem_prov, projector)
+    vision  = VisionWorker(normalize_source(args.source), tracker)
 
     # Build GUI
     GroundStationApp(root, vision, telem, vis_w, vis_h)
